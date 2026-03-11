@@ -1526,6 +1526,7 @@ pub fn connectProxied(
     proxy: *Proxy,
     proxied_host: HostName,
     proxied_port: u16,
+    protocol: Protocol,
 ) !*Connection {
     const io = client.io;
     if (!proxy.supports_connect) return error.TunnelNotSupported;
@@ -1533,7 +1534,7 @@ pub fn connectProxied(
     if (client.connection_pool.findConnection(io, .{
         .host = proxied_host,
         .port = proxied_port,
-        .protocol = proxy.protocol,
+        .protocol = protocol,
     })) |node| return node;
 
     var maybe_valid = false;
@@ -1576,6 +1577,30 @@ pub fn connectProxied(
         // else, it will only be released when the client is de-initialized.
         req.connection = null;
 
+        if (protocol == .tls) {
+            // The proxy connection is plain, but the proxied connection is tls.
+            // We need to upgrade the connection to a tls connection.
+            if (connection.protocol == .tls) {
+                // tls-in-tls is not supported.
+                connection.closing = true;
+                client.connection_pool.release(connection, io);
+                return error.TunnelNotSupported;
+            }
+
+            const stream = connection.getStream();
+            const tc = Connection.Tls.create(client, proxied_host, proxied_port, stream) catch unreachable;
+
+            client.connection_pool.mutex.lock(io) catch unreachable;
+            client.connection_pool.used.remove(&connection.pool_node);
+            client.connection_pool.mutex.unlock(io);
+
+            const plain: *Connection.Plain = @alignCast(@fieldParentPtr("connection", connection));
+            plain.destroy();
+
+            client.connection_pool.addUsed(io, &tc.connection);
+            return &tc.connection;
+        }
+
         connection.closing = false;
 
         return connection;
@@ -1612,7 +1637,7 @@ pub fn connect(
     }
 
     if (proxy.supports_connect) tunnel: {
-        return connectProxied(client, proxy, host, port) catch |err| switch (err) {
+        return connectProxied(client, proxy, host, port, protocol) catch |err| switch (err) {
             error.TunnelNotSupported => break :tunnel,
             else => |e| return e,
         };
